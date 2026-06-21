@@ -1,113 +1,309 @@
-#!/usr/bin/python
-# -*- coding: gbk -*-
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
-
-import urllib, urllib2, cookielib
-import sys
+import html
+import http.cookiejar
 import os
+import socket
+import sys
 from getpass import getpass
-try:
-    from bs4 import BeautifulSoup
-except:
-    print "Error,this may help:"
-    print "    pip install BeautifulSoup4"
-try:
-    import requests
-except:
-    print "Error,this may help:"
-    print "    pip install requests"
+from html.parser import HTMLParser
+from urllib import error, parse, request
 
-try:
-    sys_encode = os.popen('locale').readlines()[0].split('.')[1].strip()[:-1]  #popen（）函数：打开命令中的文件，或者读取命令下的终端返回信息  popen（）里面的参数是终端命令
-except:
-    print "please make sure running this script on *nix system"
-    sys.exit(0)
-username = raw_input("ID: ")   #从键盘读取用户名，raw_input() 全部以字符串的形式读取
-password = getpass("PASSWORD: ") #专门用于输入密码的模块，带的参数是提示字符串
-comment = raw_input("COMMENT: ")
-comment = comment.decode(sys_encode)  #对评价进行解码
-degree = raw_input("degree(1-8,1 is the best): ")
-degree = degree.decode(sys_encode).encode('GBK')
-if int(degree)  not in range(1,8):
-    print "input out of range,retry again"
-    sys.exit(0)
+BASE_URL = os.environ.get('BUPTJW_BASE_URL', 'https://jwgl.bupt.edu.cn').rstrip('/')
+TIMEOUT = 30
 
-degree_const = {  #等级对应分数的字典
-        1: '0.99',
-        2: '0.95',
-        3: '0.9',
-        4: '0.85',
-        5: '0.8',
-        6: '0.7',
-        7: '0.6',
-        8: '0.4'}
-login_data = {       #注意，我们有的时候需要将字典json化
-        'zjh': username.decode(sys_encode),
-        'mm': password.decode(sys_encode),
-        'type': 'sso'}
-login = requests.post('http://10.3.240.70/jwLoginAction.do', data=login_data)  #进行登录，表单提交  就是一个简单的post，需要提交的表单参数，带在后面。
-cook = "JSESSIONID=" + login.cookies['JSESSIONID']
-fetch_list = requests.get('http://10.3.240.70/jxpgXsAction.do?oper=listWj',cookies=login.cookies)
-soup = BeautifulSoup(fetch_list.content.decode('gbk'))   #不用xpath的话，得到的响应直接放在bs里面
-data_init = soup.find_all(title="评估")
-data = []
-for i in data_init:
-    data.append({'wjbm':i['name'].split('#@')[0],
-        'bpr':i['name'].split('#@')[1],
-        'pgnr':i['name'].split('#@')[5],
-        'wjmc':i['name'].split('#@')[3],
-        'bprm':i['name'].split('#@')[2],
-        'pgnrm':i['name'].split('#@')[4],})
-if len(data) == 0:
-    print "login error OR you have already done"
-    sys.exit(0)   #python程序退出
 
-for i in data:
-    pre_post_data = {
-        'wjbm': i['wjbm'].encode('GBK'),
-        'bpr': i['bpr'].encode('GBK'),
-        'pgnr': i['pgnr'].encode('GBK'),
-        'oper': 'wjShow',
-        'wjmc': i['wjmc'].encode('GBK'),
-        'bprm': i['bprm'].encode('GBK'),
-        'pgnrm': i['pgnrm'].encode('GBK'),
-        'pageSize': '20',
-        'page': '1',
-        'currentPage': '1',
-        'pageNo':''}
-    headers = {
-            'Host': '10.3.240.70',
-            'Referer': 'http://10.3.240.70/jxpgXsAction.do?oper=listWj',
-            }
-    fake_click = requests.post('http://10.3.240.70/jxpgXsAction.do', data=pre_post_data, cookies=login.cookies, headers=headers) #有了
-    post_data = {
-        'wjbm':i['wjbm'].encode('GBK'),
-        'bpr':i['bpr'].encode('GBK'),
-        'pgnr':i['pgnr'].encode('GBK'),
-        '0000000021':'10_'+degree_const[int(degree)],
-        '0000000022':'10_'+degree_const[int(degree)],
-        '0000000023':'5_'+degree_const[int(degree)],
-        '0000000024':'20_'+degree_const[int(degree)],
-        '0000000025':'10_'+degree_const[int(degree)],
-        '0000000026':'5_'+degree_const[int(degree)],
-        '0000000027':'5_'+degree_const[int(degree)],
-        '0000000028':'20_'+degree_const[int(degree)],
-        '0000000029':'10_'+degree_const[int(degree)],
-        '0000000030':'5_'+degree_const[int(degree)],
-        'zgpj': comment.encode('GBK')
+class LinkParser(HTMLParser):
+    def __init__(self, keyword):
+        super().__init__()
+        self.keyword = keyword
+        self.links = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag.lower() != 'a':
+            return
+        attr = dict(attrs)
+        href = html.unescape(attr.get('href', ''))
+        if self.keyword in href:
+            self.links.append(href)
+
+
+class EvalFormParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.action = '/jsxsd/xspj/xspj_save.do'
+        self.fields = []
+        self.radio_groups = {}
+        self.checkboxes = {}
+        self.textareas = []
+
+    def handle_starttag(self, tag, attrs):
+        attr = dict(attrs)
+        tag = tag.lower()
+        if tag == 'form' and attr.get('id') == 'Form1':
+            self.action = html.unescape(attr.get('action') or self.action)
+            return
+        if tag == 'textarea':
+            name = attr.get('name')
+            if name:
+                self.textareas.append(name)
+            return
+        if tag != 'input':
+            return
+        name = attr.get('name')
+        if not name:
+            return
+        value = html.unescape(attr.get('value', ''))
+        input_type = attr.get('type', 'text').lower()
+        if input_type == 'radio':
+            self.radio_groups.setdefault(name, []).append(value)
+        elif input_type == 'checkbox':
+            self.checkboxes.setdefault(name, []).append(value)
+        else:
+            self.fields.append((name, value))
+
+
+class TextParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.parts = []
+
+    def handle_data(self, data):
+        text = data.strip()
+        if text:
+            self.parts.append(text)
+
+
+def decode_page(content):
+    for encoding in ('utf-8', 'gbk'):
+        try:
+            return content.decode(encoding)
+        except UnicodeDecodeError:
+            pass
+    return content.decode('utf-8', errors='ignore')
+
+
+def full_url(url):
+    return parse.urljoin(BASE_URL + '/', html.unescape(url))
+
+
+def post(opener, url, data, headers=None):
+    encoded = parse.urlencode(data).encode('utf-8')
+    req = request.Request(full_url(url), data=encoded, headers=headers or {})
+    with opener.open(req, timeout=TIMEOUT) as resp:
+        return resp.read()
+
+
+def get(opener, url, headers=None):
+    req = request.Request(full_url(url), headers=headers or {})
+    with opener.open(req, timeout=TIMEOUT) as resp:
+        return resp.read()
+
+
+def check_base_url():
+    parsed = parse.urlparse(BASE_URL)
+    host = parsed.hostname
+    port = parsed.port or (443 if parsed.scheme == 'https' else 80)
+    if not host:
+        print(f"invalid BASE_URL: {BASE_URL}")
+        sys.exit(1)
+    try:
+        with socket.create_connection((host, port), timeout=5):
+            return
+    except OSError as exc:
+        print(f"cannot connect to {host}:{port}: {exc}")
+        print("please connect to BUPT campus network/VPN, or set BUPTJW_BASE_URL to the reachable jw system URL.")
+        sys.exit(1)
+
+
+def read_password():
+    if not sys.stdin.isatty():
+        return input("PASSWORD: ")
+    try:
+        return getpass("PASSWORD: ")
+    except EOFError:
+        return input("PASSWORD: ")
+
+
+def encode_inp(value):
+    key = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/='
+    output = ''
+    i = 0
+    while i < len(value):
+        chr1 = ord(value[i])
+        i += 1
+        chr2 = ord(value[i]) if i < len(value) else None
+        i += 1
+        chr3 = ord(value[i]) if i < len(value) else None
+        i += 1
+
+        enc1 = chr1 >> 2
+        enc2 = ((chr1 & 3) << 4) | ((chr2 or 0) >> 4)
+        enc3 = (((chr2 or 0) & 15) << 2) | ((chr3 or 0) >> 6)
+        enc4 = (chr3 or 0) & 63
+        if chr2 is None:
+            enc3 = enc4 = 64
+        elif chr3 is None:
+            enc4 = 64
+        output += key[enc1] + key[enc2] + key[enc3] + key[enc4]
+    return output
+
+
+def page_text(page):
+    parser = TextParser()
+    parser.feed(page)
+    return ' '.join(parser.parts)
+
+
+def is_login_page(page):
+    return (
+        '/jsxsd/xk/LoginToXk' in page
+        or 'id="userAccount"' in page
+        or "id='userAccount'" in page
+        or '<title>登录</title>' in page
+    )
+
+
+def login(opener, username, password):
+    get(opener, '/jsxsd/')
+    data = {
+        'userAccount': username,
+        'userPassword': '',
+        'encoded': encode_inp(username) + '%%%' + encode_inp(password),
     }
-    headers = {
-            'Host': '10.3.240.70',
-            'Referer': 'http://10.3.240.70'
-            }   #这个响应头感觉好鸡肋
+    post(opener, '/jsxsd/xk/LoginToXk', data, {
+        'Origin': BASE_URL,
+        'Referer': f'{BASE_URL}/jsxsd/',
+    })
+    page = decode_page(get(opener, '/jsxsd/xspj/xspj_find.do'))
+    if is_login_page(page):
+        text = page_text(page)
+        hints = [part for part in ('用户名', '密码', '验证码', '错误', '失败') if part in text]
+        suffix = f": {'/'.join(hints)}" if hints else ""
+        print(f"login failed{suffix}, please check ID/PASSWORD")
+        sys.exit(1)
 
-    #最重要的一步
-    vote = requests.post('http://10.3.240.70/jxpgXsAction.do?oper=wjpg', data=post_data, cookies=login.cookies, headers=headers)  #最后，其实就是使用post进行这样一个表单提交，提交表单的方式，基本都是post
-    out =  vote.content     #与vote.text  效果一样，得到响应网页的源码        #需要post的数据，就是我们需要提交的数据 data = post_data
-    if str(out).find('成功') >= 0:
-        print "---- success on " + i['bprm']
-    else:
-        print "---- fail on " + i['bprm']
-        print "so embarrassed.."
 
-print "Done,see you"
+def parse_links(page, keyword):
+    parser = LinkParser(keyword)
+    parser.feed(page)
+    return list(dict.fromkeys(parser.links))
+
+
+def get_list_links(opener):
+    find_page = decode_page(get(opener, '/jsxsd/xspj/xspj_find.do'))
+    list_links = parse_links(find_page, '/jsxsd/xspj/xspj_list.do')
+    if not list_links:
+        print("no evaluation batch found")
+        sys.exit(0)
+    return list_links
+
+
+def get_edit_links(opener, list_url):
+    list_page = decode_page(get(opener, list_url))
+    return parse_links(list_page, '/jsxsd/xspj/xspj_edit.do'), list_page
+
+
+def choose_radio_fields(radio_groups, degree):
+    fields = []
+    names = [name for name in radio_groups if name.startswith('pj0601id_')]
+    for idx, name in enumerate(names):
+        values = radio_groups[name]
+        choice = max(0, min(degree - 1, len(values) - 1))
+        if len(names) > 1 and idx == len(names) - 1:
+            choice = 1 if choice == 0 and len(values) > 1 else max(0, choice - 1)
+        fields.append((name, values[choice]))
+    return fields
+
+
+def build_eval_data(page, degree, comment):
+    parser = EvalFormParser()
+    parser.feed(page)
+    data = []
+    for name, value in parser.fields:
+        if name == 'issubmit':
+            value = '0'
+        elif name == 'sfxyt':
+            value = '0'
+        elif name == 'sava':
+            value = '0'
+        data.append((name, value))
+
+    data.extend(choose_radio_fields(parser.radio_groups, degree))
+
+    positive_comments = parser.checkboxes.get('zgpyids', [])[:3]
+    for value in positive_comments:
+        data.append(('zgpyids', value))
+
+    for name in parser.textareas:
+        data.append((name, comment))
+
+    return parser.action, data
+
+
+def save_one(opener, edit_url, degree, comment):
+    page = decode_page(get(opener, edit_url, {'Referer': f'{BASE_URL}/jsxsd/xspj/xspj_find.do'}))
+    action, data = build_eval_data(page, degree, comment)
+    response = decode_page(post(opener, action, data, {'Referer': full_url(edit_url)}))
+    return response
+
+
+def submit_all(opener, list_page):
+    pj01id = ''
+    parser = EvalFormParser()
+    parser.feed(list_page)
+    for name, value in parser.fields:
+        if name == 'pj01id' and value:
+            pj01id = value
+            break
+    if not pj01id:
+        print("cannot submit: pj01id not found")
+        return
+    post(opener, f'/jsxsd/xspj/xspj_yjtj.do?pj01id={parse.quote(pj01id)}', parser.fields)
+    print("submitted all saved evaluations")
+
+
+def main():
+    check_base_url()
+    username = input("ID: ")
+    password = read_password()
+    comment = input("COMMENT: ")
+    degree = input("degree(1-5, 1 is the best): ").strip()
+    if not degree.isdigit() or int(degree) not in range(1, 6):
+        print("input out of range, retry again")
+        sys.exit(0)
+    degree = int(degree)
+    final_submit = input("submit after saving all? (y/N): ").strip().lower() == 'y'
+
+    cookie_jar = http.cookiejar.CookieJar()
+    opener = request.build_opener(
+        request.ProxyHandler({}),
+        request.HTTPCookieProcessor(cookie_jar),
+    )
+    opener.addheaders = [('User-Agent', 'Mozilla/5.0')]
+
+    try:
+        login(opener, username, password)
+        list_links = get_list_links(opener)
+        total = 0
+        for list_link in list_links:
+            edit_links, list_page = get_edit_links(opener, list_link)
+            for idx, edit_link in enumerate(edit_links, 1):
+                save_one(opener, edit_link, degree, comment)
+                total += 1
+                print(f"---- saved {total}: {idx}/{len(edit_links)}")
+            if final_submit and edit_links:
+                refreshed_list_page = decode_page(get(opener, list_link))
+                submit_all(opener, refreshed_list_page)
+        if total == 0:
+            print("no course evaluation item found")
+            return
+        print("Done, see you")
+    except (error.URLError, TimeoutError) as exc:
+        print(f"request failed: {exc}")
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()
